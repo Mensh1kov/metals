@@ -118,25 +118,23 @@ object SemanticTokensProvider {
       }
       val buffer = ListBuffer.empty[Integer]
 
-      tokens.foldLeft((Line(0, 0), nodes, false, Option.empty[SQLToken])) {
-        case ((delta, nodesIterator, isSQLInterpolator, lastSQLToken), tk) =>
+      tokens.foldLeft((Line(0, 0), nodes, SQLContext.empty)) {
+        case ((delta, nodesIterator, sqlContext), tk) =>
           val (
             (toAdd, nodesIterator0, delta0),
-            isSQLInterpolator0,
-            lastSQLToken0,
+            sqlContext0,
           ) =
             handleTokenWithSQLSupport(
               tk,
               nodesIterator,
               isScala3,
               delta,
-              isSQLInterpolator,
-              lastSQLToken,
+              sqlContext,
             )
           buffer.addAll(
             toAdd
           )
-          (delta0, nodesIterator0, isSQLInterpolator0, lastSQLToken0)
+          (delta0, nodesIterator0, sqlContext0)
       }
       buffer.toList
     }
@@ -144,19 +142,67 @@ object SemanticTokensProvider {
 
   private val acceptedSQLInterpolations = Set("sql", "fr", "SQL")
 
+  private case class SQLContext(
+      private val interpolatorStack: List[SQLContext.Interpolator]
+  ) {
+    val isSQLInterpolator: Boolean =
+      interpolatorStack.headOption.exists(_.isSQLInterpolator)
+    def pushSQLInterpolator: SQLContext = this.copy(interpolatorStack =
+      SQLContext.Interpolator.SQL(None) :: interpolatorStack
+    )
+    def pushNonSQLInterpolator: SQLContext = this.copy(interpolatorStack =
+      SQLContext.Interpolator.NonSQL :: interpolatorStack
+    )
+    def pushLastSQLToken(token: Option[SQLToken]): SQLContext =
+      interpolatorStack match {
+        case SQLContext.Interpolator.SQL(_) :: tail =>
+          this.copy(interpolatorStack =
+            SQLContext.Interpolator.SQL(token) :: tail
+          )
+        case _ => this
+      }
+    def popInterpolator: SQLContext =
+      this.copy(interpolatorStack = interpolatorStack.drop(1))
+    def lastSQLToken: Option[SQLToken] = interpolatorStack.headOption.collect {
+      case SQLContext.Interpolator.SQL(lastSQLToken) => lastSQLToken
+    }.flatten
+  }
+
+  private object SQLContext {
+    val empty: SQLContext = SQLContext(Nil)
+    sealed trait Interpolator {
+      def isSQLInterpolator: Boolean
+    }
+    object Interpolator {
+      case object NonSQL extends Interpolator {
+        override val isSQLInterpolator = false
+      }
+      case class SQL(lastToken: Option[SQLToken]) extends Interpolator {
+        override val isSQLInterpolator = true
+      }
+    }
+  }
+
   private def handleTokenWithSQLSupport(
       tk: scala.meta.tokens.Token,
       nodesIterator: List[Node],
       isScala3: Boolean,
       delta: Line,
-      isSQLInterpolator: Boolean,
-      lastSQLToken: Option[SQLToken],
-  ): ((List[Integer], List[Node], Line), Boolean, Option[SQLToken]) = tk match {
+      sqlContext: SQLContext,
+  ): ((List[Integer], List[Node], Line), SQLContext) = tk match {
     case Token.Interpolation.Id(id) if acceptedSQLInterpolations(id) =>
-      (handleToken(tk, nodesIterator, isScala3, delta), true, None)
-    case tk: Token.Interpolation.Part if isSQLInterpolator =>
+      (
+        handleToken(tk, nodesIterator, isScala3, delta),
+        sqlContext.pushSQLInterpolator,
+      )
+    case Token.Interpolation.Id(_) =>
+      (
+        handleToken(tk, nodesIterator, isScala3, delta),
+        sqlContext.pushNonSQLInterpolator,
+      )
+    case tk: Token.Interpolation.Part if sqlContext.isSQLInterpolator =>
       val buffer = ListBuffer.empty[Integer]
-      val sqlTokens = SQLTokenizer.tokenize(tk.text, lastSQLToken)
+      val sqlTokens = SQLTokenizer.tokenize(tk.text, sqlContext.lastSQLToken)
       val (delta0, lastToken0) =
         sqlTokens.foldLeft((delta, Option.empty[SQLToken])) {
           case ((delta, _), tk) =>
@@ -164,14 +210,19 @@ object SemanticTokensProvider {
             buffer.addAll(toAdd)
             (delta0, Some(tk))
         }
-      ((buffer.toList, nodesIterator, delta0), isSQLInterpolator, lastToken0)
-    case Token.Interpolation.End() if isSQLInterpolator =>
-      (handleToken(tk, nodesIterator, isScala3, delta), false, None)
+      (
+        (buffer.toList, nodesIterator, delta0),
+        sqlContext.pushLastSQLToken(lastToken0),
+      )
+    case Token.Interpolation.End() =>
+      (
+        handleToken(tk, nodesIterator, isScala3, delta),
+        sqlContext.popInterpolator,
+      )
     case _ =>
       (
         handleToken(tk, nodesIterator, isScala3, delta),
-        isSQLInterpolator,
-        lastSQLToken,
+        sqlContext,
       )
   }
 
